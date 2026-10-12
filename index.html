@@ -429,6 +429,16 @@ input[type="color"] { width: 30px; height: 26px; padding: 1px 2px; border: 1px s
 .trow input[type="text"]:disabled { opacity: 0.5; }
 .lnames { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
 .lname { display: grid; grid-template-columns: 12px minmax(0, 1fr); align-items: center; gap: 7px; }
+
+/* start values */
+.ptable input.num { width: 100%; height: 26px; font: 12px var(--mono); padding: 0 6px; text-align: right; font-variant-numeric: tabular-nums; }
+.ptable input.num.user { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.ptable input.num.bad { border-color: var(--err); box-shadow: 0 0 0 1px var(--err); }
+.ptable input.num:disabled { opacity: 0.45; }
+.ptable tr.user td:first-child { color: var(--accent); font-weight: 600; }
+.ptable.stable td:nth-child(2) { width: 46%; }
+.reset-start { border: 0; background: none; color: var(--accent); cursor: pointer; font-size: 14px; padding: 0 2px; line-height: 1; }
+.reset-start:hover { color: var(--ink); }
 </style>
 <script>window.PB_OFFLINE = true;</script>
 <script>/**
@@ -3191,6 +3201,32 @@ PB.math = (function () {
     return { p: Array.from(raw), err: Array.from(err), evalT: evalT, yfit: yfit, stats: st, mu: mu, s: s };
   }
 
+  // polynomial with chosen coefficients held at given values: subtract them, solve the rest exactly
+  function polyfitFixed(x, y, w, deg, fixed, vals) {
+    var n = x.length, p = deg + 1, i, q, free = [], fv = [];
+    for (q = 0; q < p; q++) { var v = vals && vals[q]; fv.push(fixed[q] ? (v !== null && v !== undefined && isFinite(v) ? +v : 0) : 0); if (!fixed[q]) free.push(q); }
+    if (n <= free.length) return { error: 'The fit needs more than ' + free.length + ' points for ' + free.length + ' free coefficients.' };
+    var yy = new Float64Array(n);
+    for (i = 0; i < n; i++) { var s = 0; for (q = 0; q < p; q++) if (fixed[q]) s += fv[q] * Math.pow(x[i], q); yy[i] = y[i] - s; }
+    var coef = fv.slice(), err = new Array(p).fill(0), norms = [], ls = null;
+    if (free.length) {
+      var cols = free.map(function (k) {
+        var c = new Float64Array(n), s2 = 0;
+        for (var r = 0; r < n; r++) { c[r] = Math.pow(x[r], k); s2 += c[r] * c[r]; }
+        var nr = Math.sqrt(s2) || 1; norms.push(nr);
+        for (r = 0; r < n; r++) c[r] /= nr;
+        return c;
+      });
+      ls = lstsq(cols, yy, w);
+      if (!ls) return { error: 'This polynomial cannot be fitted with these coefficients fixed. Fix fewer of them or lower the degree.' };
+      free.forEach(function (k, j) { coef[k] = ls.coef[j] / norms[j]; });
+    }
+    var evalT = function (xv) { var v2 = 0; for (var k2 = deg; k2 >= 0; k2--) v2 = v2 * xv + coef[k2]; return v2; };
+    var yfit = Float64Array.from(x, evalT), st = fitStats(y, yfit, w, free.length);
+    if (ls) free.forEach(function (k, j) { var acc = 0; for (var c2 = j; c2 < free.length; c2++) acc += ls.Rinv[j][c2] * ls.Rinv[j][c2]; err[k] = Math.sqrt(Math.max(0, acc * st.redChi2)) / norms[j]; });
+    return { p: coef, err: err, evalT: evalT, yfit: yfit, stats: st };
+  }
+
   /* ---------- smoothing ---------- */
   function movingAverage(y, w, trailing) {
     var n = y.length, out = new Float64Array(n), h = Math.floor(w / 2), cs = new Float64Array(n + 1);
@@ -3421,17 +3457,75 @@ PB.math = (function () {
   var SUP = { '0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴', '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹' };
   function sup(n) { return String(n).split('').map(function (c) { return SUP[c] || c; }).join(''); }
   // spec: {model, degree, nPeaks, shape, baseline, expr, start:[...]|null, fixed:[], lower:[], upper:[], givenPeaks, smoother opts}
-  function runFit(spec, xIn, yIn, wIn, opt) {
-    opt = opt || {};
-    var n0 = xIn.length, X = [], Y = [], W = wIn ? [] : null, i;
-    for (i = 0; i < n0; i++) {
+  function cleanXY(xIn, yIn, wIn) {
+    var n0 = xIn.length, X = [], Y = [], W = wIn ? [] : null;
+    for (var i = 0; i < n0; i++) {
       var xv = xIn[i], yv = yIn[i];
       if (!(xv === xv && yv === yv && isFinite(xv) && isFinite(yv))) continue;
       if (wIn) { var wv = wIn[i]; if (!(wv > 0 && isFinite(wv))) continue; W.push(wv); }
       X.push(xv); Y.push(yv);
     }
     var srt = sortXY(Float64Array.from(X), Float64Array.from(Y), W ? Float64Array.from(W) : null);
-    var x = srt.x, y = srt.y, w = srt.extra, n = x.length;
+    return { x: srt.x, y: srt.y, w: srt.extra };
+  }
+  // the model, its parameters, limits and automatic start values, exactly as the fit uses them
+  function prepareModel(spec, x, y) {
+    var model = spec.model, M = MODELS[model];
+    if (!M || M.poly || SMOOTHERS[model]) return null;
+    var n = x.length, params, evalArr, lower = (M.lower || []).slice(), upper = (M.upper || []).slice(), p0, x0 = 0, mm = null, eqTemplate;
+    if (M.shift) x0 = x[0];
+    var xt = x0 ? Float64Array.from(x, function (v) { return v - x0; }) : x;
+    if (M.multi) {
+      var np = Math.max(1, Math.min(30, spec.nPeaks | 0 || 1));
+      var g = multiGuess(x, y, np, spec.shape || 'gauss', spec.baseline || 'linear', spec.givenPeaks);
+      mm = multiModel(np, spec.shape || 'gauss', spec.baseline || 'linear', g.xmid);
+      params = mm.params; evalArr = mm.evalArr; lower = mm.lower; upper = mm.upper; p0 = g.p;
+      eqTemplate = 'y = baseline + ' + np + ' × ' + ({ gauss: 'Gaussian', lorentz: 'Lorentzian', pvoigt: 'pseudo-Voigt' }[spec.shape || 'gauss']);
+    } else if (M.custom) {
+      var cm;
+      try { cm = PB.expr.model(spec.expr || ''); } catch (e) { return { error: e.message }; }
+      if (!cm.params.length) return { error: 'The equation has no parameters to fit. Use names such as a, b, A, x0, sigma.' };
+      params = cm.params; evalArr = cm.evalArr; p0 = customGuess(params, x, y);
+      eqTemplate = 'y = ' + String(spec.expr).replace(/^\s*y\s*=\s*/i, '');
+    } else {
+      params = M.params;
+      var fn = M.f;
+      evalArr = function (xx, pp, out) { for (var q = 0; q < xx.length; q++) out[q] = fn(xx[q], pp); return out; };
+      p0 = M.guess(xt, y);
+      eqTemplate = M.eq;
+    }
+    var widthIdx = { gauss: 3, lorentz: 3, pvoigt: 3 }[model];
+    var span0 = Math.abs(x[n - 1] - x[0]) || 1, dx0 = span0 / Math.max(1, n - 1);
+    if (widthIdx !== undefined) {
+      lower = lower.slice(); upper = upper.slice();
+      if (!(lower[widthIdx] > 0)) lower[widthIdx] = 0.25 * dx0;
+      if (!(upper[widthIdx] > 0)) upper[widthIdx] = (model === 'pvoigt' ? 2 : 1) * span0;
+    }
+    return { M: M, params: params, evalArr: evalArr, lower: lower, upper: upper, p0: Array.from(p0), x0: x0, xt: xt, mm: mm, eqTemplate: eqTemplate, widthIdx: widthIdx, span0: span0, dx0: dx0 };
+  }
+  // automatic start values for the data in the fit range (what the fit starts from when nothing is typed)
+  function startValues(spec, xIn, yIn) {
+    var d = cleanXY(xIn, yIn);
+    if (d.x.length < 2) return null;
+    var pr = prepareModel(spec, d.x, d.y);
+    return pr && !pr.error ? pr.p0 : null;
+  }
+  // the model drawn with given start values (empty ones automatic), over the fit range
+  function startCurve(spec, xIn, yIn, start) {
+    var d = cleanXY(xIn, yIn), n = d.x.length;
+    if (n < 2) return null;
+    var pr = prepareModel(spec, d.x, d.y);
+    if (!pr || pr.error) return null;
+    var p = pr.p0.map(function (v, k) { var s = start && start[k]; return s !== null && s !== undefined && isFinite(s) ? +s : v; });
+    var N = Math.min(4000, Math.max(400, 2 * n)), a = d.x[0], b = d.x[n - 1], xs = new Float64Array(N), ys = new Float64Array(N);
+    for (var i = 0; i < N; i++) xs[i] = a + (b - a) * i / (N - 1);
+    pr.evalArr(Float64Array.from(xs, function (v) { return v - pr.x0; }), p, ys);
+    return { x: xs, y: ys, p: p };
+  }
+  function runFit(spec, xIn, yIn, wIn, opt) {
+    opt = opt || {};
+    var cl = cleanXY(xIn, yIn, wIn), i;
+    var x = cl.x, y = cl.y, w = cl.w, n = x.length;
     if (n < 2) return { error: 'There are fewer than 2 data points in the fit range.' };
     var model = spec.model, res = { model: model, n: n, xmin: x[0], xmax: x[n - 1] };
     if (SMOOTHERS[model]) {
@@ -3446,7 +3540,9 @@ PB.math = (function () {
     var xs = function (k) { return k; };
     if (M.poly) {
       var deg = model === 'linear' ? 1 : Math.max(1, Math.min(12, spec.degree | 0 || 2));
-      var pf = polyfit(x, y, w, deg);
+      var held = spec.fixed && spec.fixed.length === deg + 1 && spec.fixed.some(Boolean) ? spec.fixed : null;
+      var pf = held ? polyfitFixed(x, y, w, deg, held, spec.start || []) : polyfit(x, y, w, deg);
+      res.fixed = held || [];
       if (pf.error) return { error: pf.error };
       res.names = []; for (i = 0; i <= deg; i++) res.names.push(model === 'linear' ? (i === 0 ? 'a' : 'b') : 'a' + i);
       res.labels = model === 'linear' ? ['Intercept a', 'Slope b'] : res.names.map(function (nm, k) { return 'a' + k + (k ? ' (x' + sup(k) + ')' : ''); });
@@ -3456,44 +3552,21 @@ PB.math = (function () {
       res.derived = [];
       if (model === 'linear') {
         var b = pf.p[1];
-        if (b !== 0) res.derived.push({ name: 'x-intercept', v: -pf.p[0] / b, e: Math.abs(pf.p[0] / b) * Math.sqrt(Math.pow(pf.err[0] / (pf.p[0] || 1), 2) + Math.pow(pf.err[1] / b, 2)) });
+        if (b !== 0 && !(held && held[0])) res.derived.push({ name: 'x-intercept', v: -pf.p[0] / b, e: Math.abs(pf.p[0] / b) * Math.sqrt(Math.pow(pf.err[0] / (pf.p[0] || 1), 2) + Math.pow(pf.err[1] / b, 2)) });
       }
     } else {
-      var params, evalArr, lower = (M.lower || []).slice(), upper = (M.upper || []).slice(), p0, x0 = 0, mm = null;
-      if (M.shift) x0 = x[0];
-      var xt = x0 ? Float64Array.from(x, function (v) { return v - x0; }) : x;
-      if (M.multi) {
-        var np = Math.max(1, Math.min(30, spec.nPeaks | 0 || 1));
-        var g = multiGuess(x, y, np, spec.shape || 'gauss', spec.baseline || 'linear', spec.givenPeaks);
-        mm = multiModel(np, spec.shape || 'gauss', spec.baseline || 'linear', g.xmid);
-        params = mm.params; evalArr = mm.evalArr; lower = mm.lower; upper = mm.upper; p0 = g.p;
-        res.eqTemplate = 'y = baseline + ' + np + ' × ' + ({ gauss: 'Gaussian', lorentz: 'Lorentzian', pvoigt: 'pseudo-Voigt' }[spec.shape || 'gauss']);
-      } else if (M.custom) {
-        var cm;
-        try { cm = PB.expr.model(spec.expr || ''); } catch (e) { return { error: e.message }; }
-        if (!cm.params.length) return { error: 'The equation has no parameters to fit. Use names such as a, b, A, x0, sigma.' };
-        params = cm.params; evalArr = cm.evalArr; p0 = customGuess(params, x, y);
-        res.eqTemplate = 'y = ' + String(spec.expr).replace(/^\s*y\s*=\s*/i, '');
-      } else {
-        params = M.params;
-        var fn = M.f;
-        evalArr = function (xx, pp, out) { for (var q = 0; q < xx.length; q++) out[q] = fn(xx[q], pp); return out; };
-        p0 = M.guess(xt, y);
-        res.eqTemplate = M.eq;
-      }
-      if (spec.start && spec.start.length === params.length) p0 = spec.start.map(function (v, k) { return (v === null || v === undefined || !isFinite(v)) ? p0[k] : v; });
+      var pr = prepareModel(spec, x, y);
+      if (!pr) return { error: 'Unknown model.' };
+      if (pr.error) return { error: pr.error };
+      var params = pr.params, evalArr = pr.evalArr, lower = pr.lower, upper = pr.upper, p0 = pr.p0, x0 = pr.x0, xt = pr.xt, mm = pr.mm;
+      var widthIdx = pr.widthIdx, span0 = pr.span0, dx0 = pr.dx0;
+      res.eqTemplate = pr.eqTemplate; res.autoStart = p0.slice();
+      if (spec.start && spec.start.length === params.length) p0 = spec.start.map(function (v, k) { return (v === null || v === undefined || !isFinite(v)) ? p0[k] : +v; });
       var fixed = spec.fixed && spec.fixed.length === params.length ? spec.fixed : [];
       if (spec.lower && spec.lower.length === params.length) lower = params.map(function (_, k) { var u = spec.lower[k]; return (u === null || u === undefined || !isFinite(u)) ? lower[k] : u; });
       if (spec.upper && spec.upper.length === params.length) upper = params.map(function (_, k) { var u = spec.upper[k]; return (u === null || u === undefined || !isFinite(u)) ? upper[k] : u; });
-      var widthIdx = { gauss: 3, lorentz: 3, pvoigt: 3 }[model];
-      var span0 = Math.abs(x[n - 1] - x[0]) || 1, dx0 = span0 / Math.max(1, n - 1);
-      if (widthIdx !== undefined) {
-        lower = lower.slice(); upper = upper.slice();
-        if (!(lower[widthIdx] > 0)) lower[widthIdx] = 0.25 * dx0;
-        if (!(upper[widthIdx] > 0)) upper[widthIdx] = (model === 'pvoigt' ? 2 : 1) * span0;
-      }
       var fitOpts = { fixed: fixed, lower: lower, upper: upper, maxIter: spec.maxIter || 400 };
-      var userStart = spec.start && spec.start.some(function (v) { return v !== null && v !== undefined && isFinite(v); });
+      var userStart = !!(spec.start && spec.start.some(function (v, k) { return v !== null && v !== undefined && isFinite(v) && !fixed[k]; }));
       var fit;
       if (widthIdx !== undefined && !userStart) {
         // a noise spike or an edge peak must not trap the fit: screen several starts, then refine the best
@@ -3521,6 +3594,7 @@ PB.math = (function () {
       if (fit.error) return { error: fit.error };
       res.names = params; res.labels = params.slice(); res.p = fit.p; res.err = fit.err.map(function (e, k) { return fixed[k] ? 0 : e; });
       res.fixed = fixed; res.start = p0; res.converged = fit.converged; res.iters = fit.iters;
+      res.userStart = userStart; res.multiStart = widthIdx !== undefined && !userStart;
       var yfit = new Float64Array(n); evalArr(xt, fit.p, yfit);
       res.yfit = yfit;
       res.stats = fitStats(y, yfit, w, fit.free.length);
@@ -3564,7 +3638,7 @@ PB.math = (function () {
     runFit: runFit, expShapeGuess: expShapeGuess,
     solve: solve, invert: invert, lstsq: lstsq, lm: lm, propagate: propagate, fitStats: fitStats, basicStats: basicStats, sortXY: sortXY,
     interpAt: interpAt, crossings: crossings, MODELS: MODELS, multiModel: multiModel, multiGuess: multiGuess, customGuess: customGuess,
-    polyfit: polyfit, peakGuess: peakGuess, peakGuesses: peakGuesses, SMOOTHERS: SMOOTHERS, smooth: smooth, localPoly: localPoly, movingAverage: movingAverage,
+    polyfit: polyfit, polyfitFixed: polyfitFixed, peakGuess: peakGuess, peakGuesses: peakGuesses, startValues: startValues, startCurve: startCurve, prepareModel: prepareModel, cleanXY: cleanXY, SMOOTHERS: SMOOTHERS, smooth: smooth, localPoly: localPoly, movingAverage: movingAverage,
     alsBaseline: alsBaseline, polyBaseline: polyBaseline, snipBaseline: snipBaseline, linearBaseline: linearBaseline, findPeaks: findPeaks,
     median: median, linreg: linreg, FWHM_G: FWHM_G, noiseSigma: noiseSigma, adaptiveSmooth: adaptiveSmooth
   };
@@ -4158,7 +4232,7 @@ PB.guide = (function () {
 <li>Choose the <b>Method</b>; the equation and a short explanation appear below it. See ${L('models', 'all fit models')}.</li>
 <li>Under <b>Use</b>, keep <i>Whole curve</i> or choose <i>Part of it</i>: type the X range, <b>Pick on plot</b> (drag across the plot) or take the <b>Visible</b> range. The range is shaded on the plot.</li>
 <li>Choose <b>Weights</b>: equal, counting statistics (1/y, for photon or event counts) or the Y error column (1/σ²).</li>
-<li>Optionally open <b>Start values, fixed values and limits</b>. Empty start values are guessed from the data (shown in grey); a ticked <i>Fix</i> keeps a parameter at its start value; Min and Max keep it within limits.</li>
+<li>Check the <b>Start values</b>. They are guessed from the data in the fit range, and the dashed <b>start curve</b> on the plot shows where the fit will begin. Type any value to start there instead (your values are highlighted; ↺ returns to the guess). <i>Fix</i> holds a value during the fit, and <b>Limits</b> adds Min and Max.</li>
 <li>Press <b>Fit</b>.</li>
 </ol>
 <h4>The result card</h4>
@@ -4169,6 +4243,9 @@ PB.guide = (function () {
 <li><b>Copy</b> puts the values on the clipboard, <b>Save curve</b> saves the fitted curve as CSV, <b>Edit</b> loads the settings back so a new fit replaces this one. ◉ hides it and ✕ removes it.</li>
 </ul>
 <p>Fits follow your data: change a transform or column and they are recomputed. The <b>Fit report</b> tab below the plot lists every result as text.</p>
+<h4>Exploring start values</h4>
+<p>Fits that search iteratively can end in different results from different starting points. Move a start value, watch the dashed curve, and fit again. <b>Use as start values</b> on a result card copies its fitted values into the start values, so you can refine step by step, and the fit report lists where each fit started. <b>Guess again</b> returns to the guessed values.</p>
+<p>Straight lines and polynomials are solved exactly, so they have no start values and always give the best possible fit. You can still hold coefficients fixed, for example <code>a = 0</code> for a line through the origin.</p>
 <h4>Noisy data</h4>
 <p>For peaks, start values are found on a copy of the curve smoothed just enough to rise above the noise, and the fit is started from several sensible positions and widths, keeping the best. A single noisy point therefore cannot capture the fit. If a fitted peak still comes out narrower than two data points, the result card warns you.</p>
 <h4>When a fit goes wrong</h4>
@@ -4355,7 +4432,7 @@ PB.guide = (function () {
     transforms: 'Unit conversions, baselines, derivatives, normalization and waterfall stacks.',
     navigate: 'Zoom, pan, set exact limits, read values and edit titles on the plot.',
     style: 'Looks, titles, the legend, lines, markers, colours, fonts and axes.',
-    fitting: 'Fit a model to a curve step by step, and read the result.',
+    fitting: 'Fit a model to a curve step by step, with start values you can see and change.',
     models: 'Every fit model with its equation, parameters and derived values.',
     custom: 'Write any equation: syntax, functions, examples and automatic start values.',
     uncertainty: 'What the ± values, R², RMSE and χ² mean, and how they are computed.',
@@ -5122,6 +5199,16 @@ function buildFigure(series, opt) {
       eqCount++;
     }
   });
+  // dashed start curve of the fit being prepared (Fit tab only, never exported)
+  if (!opt.forExport && !opt.passive && S.ui.tab === 'fit') {
+    const sc = draftStartCurve();
+    if (sc && series.find(q => q.key === sc.s.key)) {
+      const s = sc.s, A = D(sc.x, addOff(sc.y, s.offset || 0));
+      data.push({ type: 'scatter', mode: 'lines', x: A.x, y: A.y, name: 'Start curve', line: { color: s.color || '#888888', width: 1.6, dash: 'dash' }, opacity: 0.9, hoverinfo: 'skip', uid: 'startcurve', legendgroup: 'startcurve',
+        yaxis: anyRight && (S.series[s.key] || {}).right ? 'y2' : 'y' });
+      meta.push({ kind: 'start' });
+    }
+  }
   // peaks
   if (S.peaks.on && S.peaks.list.length) {
     const pk = S.peaks.list, px = pk.map(p => p.x), py = pk.map(p => p.y + p.offset), A = D(px, py);
@@ -5583,7 +5670,8 @@ function fitReport() {
   if (!S.fits.length) out.push('No fits yet. Use the Fit tab to add one.');
   S.fits.forEach((f, k) => {
     const s = SERIES.find(q => q.key === f.key), r = f.res;
-    out.push('#' + (k + 1) + ' ' + fitLabel(f) + ' on "' + (s ? s.name : f.key) + '"');
+    const where = s ? s.name : (() => { const i = f.key.indexOf('|'), ds = S.ds.find(q => q.id === f.key.slice(0, i)); return (ds ? ds.short : 'a closed file') + ', ' + f.key.slice(i + 1); })();
+    out.push('#' + (k + 1) + ' ' + fitLabel(f) + ' on "' + where + '"');
     if (f.missing) { out.push('   (the data for this fit is not plotted at the moment)'); out.push(''); return; }
     if (!r) { out.push(''); return; }
     if (r.error) { out.push('   Failed: ' + r.error); out.push(''); return; }
@@ -5592,6 +5680,7 @@ function fitReport() {
     out.push('   Model: ' + (r.eqTemplate || '').replace(/^y = /, 'y = '));
     if (r.x0) out.push('   x0 = ' + fmt(r.x0, 10) + ' (fixed at the start of the range)');
     r.names.forEach((n, i) => out.push('   ' + (r.labels ? r.labels[i] : n).padEnd(16) + ' = ' + U.fmtPM(r.p[i], r.err[i]) + (r.fixed && r.fixed[i] ? '  (fixed)' : '')));
+    if (r.start && r.start.length === r.names.length) out.push('   Started from: ' + r.names.map((n, i) => n + ' = ' + fmt(r.start[i], 6)).join(', ') + (r.userStart ? '  (your start values)' : r.multiStart ? '  (guessed from the data; the best of several starts was kept)' : '  (guessed from the data)'));
     (r.derived || []).forEach(d => out.push('   ' + d.name.padEnd(16) + ' = ' + U.fmtPM(d.v, d.e)));
     (r.peaks || []).forEach(p => out.push('   Peak ' + p.index + ': centre ' + U.fmtPM(p.center, p.centerErr) + ', height ' + U.fmtPM(p.amp, p.ampErr) + ', FWHM ' + U.fmtPM(p.fwhm, p.fwhmErr) + ', area ' + U.fmtPM(p.area, p.areaErr)));
     const sx = r.stats;
@@ -5865,6 +5954,17 @@ const rng = (bind, v, min, max, step, on, f) => `<div class="rng"><input type="r
 const field = (label, ctrl, hint) => `<label class="field"><span class="lab">${label}</span>${ctrl}${hint ? `<span class="hint">${hint}</span>` : ''}</label>`;
 const qh = (id, what) => `<button class="qhelp" data-action="guide" data-arg="${id}" title="Explain: ${esc(what)}" aria-label="Explain: ${esc(what)}">?</button>`;
 const mhelp = (text, topic) => text ? `<p class="mhelp">${esc(text)}${topic ? ` <button class="glink" data-action="guide" data-arg="${topic}">More</button>` : ''}</p>` : '';
+function startInput(el, done) {
+  const p = (S.draft.params || [])[+el.dataset.pi], k = el.dataset.pp;
+  if (!p) return;
+  const v = parseNum(el.value);
+  if (Number.isNaN(v)) { el.classList.add('bad'); el.setAttribute('aria-invalid', 'true'); return; }
+  el.classList.remove('bad'); el.removeAttribute('aria-invalid');
+  p[k] = v;
+  if (k === 'start') { el.classList.toggle('user', v !== null); const tr = el.closest('tr'); if (tr) tr.classList.toggle('user', v !== null); }
+  schedule();
+  if (done) renderPanel();
+}
 function fmtRange(f, v) { v = +v; if (f === 'pct') return Math.round(v) + '%'; if (f === 'pow') return '10^' + v; if (f === 'x') return v.toFixed(2); if (f === 'int') return String(Math.round(v)); return (Math.round(v * 100) / 100).toString(); }
 function fmtTag(d) { return ({ text: (d.ext || 'txt'), xlsx: d.ext || 'xlsx', fits: 'fits', tiff: 'tiff', json: 'json', npy: 'npy', jcamp: 'jdx', avantes: d.ext || 'raw8', derived: 'new' }[d.fmt] || d.fmt || '').toUpperCase().slice(0, 5); }
 
@@ -6159,7 +6259,8 @@ function modelOptionsHTML() {
 }
 function draftParamNames() {
   const d = S.draft, m = M.MODELS[d.model];
-  if (!m || m.poly) return [];
+  if (!m) return [];
+  if (m.poly) return d.model === 'linear' ? ['a', 'b'] : Array.from({ length: Math.max(1, Math.min(12, d.degree | 0 || 2)) + 1 }, (_, k) => 'a' + k);
   if (m.multi) return M.multiModel(Math.max(1, Math.min(30, d.nPeaks | 0 || 1)), d.shape, d.baseline, 0).params;
   if (m.custom) { try { return E.model(d.expr).params; } catch (e) { return null; } }
   return m.params;
@@ -6191,12 +6292,22 @@ function draftData() {
 function autoGuess() {
   const d = S.draft, m = M.MODELS[d.model], dd = draftData();
   if (!m || !dd || m.poly) return null;
-  try {
-    if (m.multi) return M.multiGuess(dd.x, dd.y, Math.max(1, d.nPeaks | 0), d.shape, d.baseline, d.givenPeaks).p;
-    if (m.custom) return M.customGuess(E.model(d.expr).params, dd.x, dd.y);
-    const x0 = m.shift ? dd.x[0] : 0;
-    return m.guess(x0 ? Float64Array.from(dd.x, v => v - x0) : dd.x, dd.y);
-  } catch (e) { return null; }
+  try { return M.startValues(fitSpec(d), dd.x, dd.y); } catch (e) { return null; }
+}
+// the model drawn with the current start values, for the dashed preview on the plot
+function draftStartCurve() {
+  const d = S.draft, m = M.MODELS[d.model];
+  if (!m || m.poly || M.SMOOTHERS[d.model] || d.preview === false || !d.params || !d.params.length) return null;
+  const s = draftSeries(), dd = draftData();
+  if (!s || !dd) return null;
+  try { const sc = M.startCurve(fitSpec(d), dd.x, dd.y, d.params.map(p => p.start)); return sc ? Object.assign(sc, { s }) : null; } catch (e) { return null; }
+}
+const fmtStart = v => { if (v === null || v === undefined || !isFinite(v)) return ''; const a = Math.abs(v); return a !== 0 && (a < 1e-4 || a >= 1e7) ? v.toExponential(5).replace(/\.?0+e/, 'e').replace('e+', 'e') : String(+(+v).toPrecision(6)); };
+function parseNum(s) {
+  const t = String(s).trim().replace(/\u2212/g, '-').replace(/\s+/g, '');
+  if (t === '') return null;
+  const v = Number(/^[-+]?\d*,\d+(e[-+]?\d+)?$/i.test(t) ? t.replace(',', '.') : t);
+  return isFinite(v) ? v : NaN;
 }
 function eqDisplay() {
   const d = S.draft, m = M.MODELS[d.model];
@@ -6245,15 +6356,28 @@ function panelFit() {
   if (d.range === 'custom') h += `<div class="row tight">${num('draft.from', d.from, 'draftrange', 'step="any" placeholder="from" style="width:28%"')}${num('draft.to', d.to, 'draftrange', 'step="any" placeholder="to" style="width:28%"')}<button class="btn small" data-action="pickFit">Pick on plot</button><button class="btn small" data-action="fitUseView" title="Use the visible X range">Visible</button></div>`;
   if (!isSmooth) {
     h += field('Weights', sel('draft.weights', [['none', 'Equal (ordinary least squares)'], ['poisson', 'Counting statistics (1/y)'], ['column', 'From the Y error column (1/σ²)']], d.weights, 'plot'));
-    if (d.params && d.params.length) {
-      const g = autoGuess();
-      h += `<details class="more" data-dk="fitparams"${keepOpen('fitparams', d.params.some(p => p.start !== null || p.fixed || p.lo !== null || p.hi !== null))}><summary>Start values, fixed values and limits</summary><div class="inner"><table class="ptable"><thead><tr><th>Name</th><th>Start</th><th>Fix</th><th>Min</th><th>Max</th></tr></thead><tbody>`;
+    if (d.params && d.params.length && m && m.poly) {
+      const labs = d.model === 'linear' ? ['a (intercept)', 'b (slope)'] : d.params.map((p, k) => 'a' + k + (k ? ' (x' + (k > 1 ? String(k).split('').map(c => '⁰¹²³⁴⁵⁶⁷⁸⁹'[+c]).join('') : '') + ')' : ''));
+      h += `<div class="field"><span class="lab">Coefficients</span><table class="ptable"><thead><tr><th>Name</th><th title="Hold this coefficient at a value">Fix</th><th>at</th></tr></thead><tbody>`;
       d.params.forEach((p, i) => {
-        h += `<tr><td>${esc(p.name)}</td><td><input type="number" step="any" data-pi="${i}" data-pp="start" value="${p.start === null ? '' : p.start}" placeholder="${g && isFinite(g[i]) ? esc(fmt(g[i], 5)) : 'auto'}" aria-label="Start value of ${esc(p.name)}"></td>
-          <td class="c"><input type="checkbox" data-pi="${i}" data-pp="fixed" ${p.fixed ? 'checked' : ''} aria-label="Fix ${esc(p.name)}"></td>
-          <td><input type="number" step="any" data-pi="${i}" data-pp="lo" value="${p.lo === null ? '' : p.lo}" aria-label="Minimum of ${esc(p.name)}"></td><td><input type="number" step="any" data-pi="${i}" data-pp="hi" value="${p.hi === null ? '' : p.hi}" aria-label="Maximum of ${esc(p.name)}"></td></tr>`;
+        h += `<tr class="${p.fixed ? 'user' : ''}"><td>${esc(labs[i] || p.name)}</td><td class="c"><input type="checkbox" data-pi="${i}" data-pp="fixed" ${p.fixed ? 'checked' : ''} aria-label="Fix ${esc(p.name)}"></td>
+          <td><input type="text" inputmode="decimal" class="num${p.fixed ? ' user' : ''}" data-pi="${i}" data-pp="start" value="${p.fixed ? esc(fmtStart(p.start === null ? 0 : p.start)) : ''}" placeholder="free" ${p.fixed ? '' : 'disabled'} aria-label="Value of ${esc(p.name)}"></td></tr>`;
       });
-      h += `</tbody></table><div class="row tight" style="margin-top:6px"><button class="btn small" data-action="clearStarts">Automatic start values</button></div><p class="hint">Empty start values are guessed from the data (shown in grey). A fixed parameter keeps its start value.</p></div></details>`;
+      h += `</tbody></table><span class="hint">Straight lines and polynomials are solved exactly, so they need no start values and always give the best fit. Tick Fix to hold a coefficient, for example a = 0 for a line through the origin.</span></div>`;
+    } else if (d.params && d.params.length) {
+      const g = autoGuess(), showLim = !!S.ui.showLimits, anyUser = d.params.some(p => p.start !== null && !p.fixed);
+      h += `<div class="field"><span class="lab">Start values</span><table class="ptable stable"><thead><tr><th>Name</th><th>Start</th><th title="Hold this value during the fit">Fix</th>${showLim ? '<th>Min</th><th>Max</th>' : ''}<th></th></tr></thead><tbody>`;
+      d.params.forEach((p, i) => {
+        const user = p.start !== null, val = user ? p.start : (g && isFinite(g[i]) ? g[i] : null);
+        h += `<tr class="${user ? 'user' : ''}"><td>${esc(p.name)}</td>
+          <td><input type="text" inputmode="decimal" class="num${user ? ' user' : ''}" data-pi="${i}" data-pp="start" value="${esc(fmtStart(val))}" aria-label="Start value of ${esc(p.name)}" title="${user ? 'Your value' : 'Guessed from the data'}"></td>
+          <td class="c"><input type="checkbox" data-pi="${i}" data-pp="fixed" ${p.fixed ? 'checked' : ''} aria-label="Fix ${esc(p.name)}"></td>
+          ${showLim ? `<td><input type="text" inputmode="decimal" class="num" data-pi="${i}" data-pp="lo" value="${esc(fmtStart(p.lo))}" placeholder="none" aria-label="Minimum of ${esc(p.name)}"></td><td><input type="text" inputmode="decimal" class="num" data-pi="${i}" data-pp="hi" value="${esc(fmtStart(p.hi))}" placeholder="none" aria-label="Maximum of ${esc(p.name)}"></td>` : ''}
+          <td class="c">${user && !p.fixed ? `<button class="reset-start" data-action="startReset" data-arg="${i}" title="Back to the guessed value" aria-label="Use the guessed value for ${esc(p.name)}">↺</button>` : ''}</td></tr>`;
+      });
+      h += `</tbody></table>`;
+      h += `<div class="row tight" style="margin-top:6px"><button class="btn small" data-action="clearStarts" ${anyUser ? '' : 'disabled'} title="Replace your start values with values guessed from the data">Guess again</button>${chk('ui.showLimits', showLim, 'Limits', 'panel')}${chk('draft.preview', d.preview !== false, 'Start curve on the plot', 'plot')}</div>`;
+      h += `<span class="hint">Guessed from the data in the fit range. Type any value to start the fit there (your values are highlighted), tick Fix to hold a value, and watch the dashed start curve.</span></div>`;
     }
   }
   h += `<div class="row tight"><button class="btn primary" data-action="runFit">${isSmooth ? 'Add smoothed curve' : 'Fit'}</button></div>`;
@@ -6281,8 +6405,8 @@ function fitListHTML() {
       (r.peaks || []).forEach(p => { body += `<tr><td>Peak ${p.index}</td><td>at ${esc(U.fmtPM(p.center, p.centerErr))}<br><span class="hint">FWHM ${esc(U.fmtPM(p.fwhm, p.fwhmErr))}, area ${esc(U.fmtPM(p.area, p.areaErr))}</span></td></tr>`; });
       body += '</table>';
       if (r.warning) body += `<div class="msg" style="color:var(--warn)">${esc(r.warning)}</div>`;
-      body += `<div class="fstats"><span>N = ${r.n}</span><span>RMSE ${fmt(r.stats.rmse, 4)}</span>${f.weights !== 'none' ? `<span>χ²ᵣ ${fmt(r.stats.redChi2, 4)}</span>` : ''}<span>adj. R² ${U.fixed(r.stats.adjR2, 4)}</span>${r.converged === false ? '<span class="warn">not fully converged</span>' : ''}</div>`;
-      body += `<div class="fbar"><button class="btn small" data-action="fitResid" data-arg="${f.id}" aria-pressed="${!!f.showResid}">Residuals</button>${r.comps ? `<button class="btn small" data-action="fitComps" data-arg="${f.id}" aria-pressed="${!!f.showComps}">Each peak</button>` : ''}<button class="btn small" data-action="fitEq" data-arg="${f.id}" aria-pressed="${!!f.showEq}">Show on plot</button><button class="btn small" data-action="fitCopy" data-arg="${f.id}">Copy</button><button class="btn small" data-action="fitCSV" data-arg="${f.id}">Save curve</button><button class="btn small" data-action="fitEdit" data-arg="${f.id}">Edit</button></div>`;
+      body += `<div class="fstats">${r.userStart ? '<span>from your start values</span>' : ''}<span>N = ${r.n}</span><span>RMSE ${fmt(r.stats.rmse, 4)}</span>${f.weights !== 'none' ? `<span>χ²ᵣ ${fmt(r.stats.redChi2, 4)}</span>` : ''}<span>adj. R² ${U.fixed(r.stats.adjR2, 4)}</span>${r.converged === false ? '<span class="warn">not fully converged</span>' : ''}</div>`;
+      body += `<div class="fbar"><button class="btn small" data-action="fitResid" data-arg="${f.id}" aria-pressed="${!!f.showResid}">Residuals</button>${r.comps ? `<button class="btn small" data-action="fitComps" data-arg="${f.id}" aria-pressed="${!!f.showComps}">Each peak</button>` : ''}<button class="btn small" data-action="fitEq" data-arg="${f.id}" aria-pressed="${!!f.showEq}">Show on plot</button><button class="btn small" data-action="fitCopy" data-arg="${f.id}">Copy</button><button class="btn small" data-action="fitCSV" data-arg="${f.id}">Save curve</button><button class="btn small" data-action="fitEdit" data-arg="${f.id}">Edit</button>${M.MODELS[r.model] && !M.MODELS[r.model].poly ? `<button class="btn small" data-action="fitStartFrom" data-arg="${f.id}" title="Copy these fitted values into the start values for a new fit">Use as start values</button>` : ''}</div>`;
     } else {
       body += `<div class="fstats"><span>${r.curve.x.length} points from x = ${fmt(r.xmin, 5)} to ${fmt(r.xmax, 5)}</span></div>`;
       body += `<div class="fbar"><button class="btn small" data-action="fitToData" data-arg="${f.id}" title="Open the smoothed curve as a new data set">Make it a data set</button><button class="btn small" data-action="fitCSV" data-arg="${f.id}">Save curve</button><button class="btn small" data-action="fitEdit" data-arg="${f.id}">Edit</button></div>`;
@@ -6967,7 +7091,22 @@ const ACT = {
   pickCrop: () => { S.pick = 'crop'; S.measure.on = false; S.addLabel = false; renderPlotbar(); schedule(); },
   fitRange: (v) => { S.draft.range = v; if (v === 'custom' && S.draft.from === null) ACT.fitUseView(); else { renderPanel(); schedule(); } },
   fitUseView: () => { const v = dataXView(); const s = draftSeries(); const mm = v || (s ? U.finiteMinMax(s.x) : null); if (mm) { S.draft.range = 'custom'; S.draft.from = +fmt(mm[0], 10); S.draft.to = +fmt(mm[1], 10); } renderPanel(); schedule(); },
-  clearStarts: () => { (S.draft.params || []).forEach(p => { p.start = null; }); renderPanel(); },
+  clearStarts: () => { (S.draft.params || []).forEach(p => { if (!p.fixed) p.start = null; }); renderPanel(); schedule(); },
+  startReset: (i) => { const p = (S.draft.params || [])[+i]; if (p) { p.start = null; renderPanel(); schedule(); } },
+  fitStartFrom: (id) => {
+    const f = S.fits.find(q => q.id === id); if (!f || !f.res || f.res.error || !f.res.names) return;
+    Object.assign(S.draft, f.spec, { key: f.key, weights: f.weights, range: f.range ? 'custom' : 'all', from: f.range ? f.range[0] : null, to: f.range ? f.range[1] : null });
+    S.draft.params = null; syncDraftParams();
+    S.draft.params.forEach((p, i) => {
+      const k = f.res.names.indexOf(p.name);
+      p.start = k >= 0 && isFinite(f.res.p[k]) ? +(+f.res.p[k]).toPrecision(8) : null;
+      p.fixed = !!(f.spec.fixed && f.spec.fixed[i]);
+      p.lo = f.spec.lower ? f.spec.lower[i] : null; p.hi = f.spec.upper ? f.spec.upper[i] : null;
+    });
+    S.editing = null;
+    ensureFitTab(); schedule();
+    toast('The fitted values are now the start values. Change any of them and press Fit for a new result.', 'info', 4500);
+  },
   clearGiven: () => { S.draft.givenPeaks = null; renderPanel(); },
   saveEq: () => { const e = S.draft.expr.trim(); if (!e) return; S.savedEqs = [e].concat((S.savedEqs || []).filter(q => q !== e)).slice(0, 30); savePrefs(); renderPanel(); toast('Equation saved in this browser', 'ok'); },
   runFit: () => {
@@ -7230,6 +7369,7 @@ function init() {
     if (el.dataset.sk && el.type !== 'checkbox' && el.tagName !== 'SELECT') { seriesProp(el); return; }
     if (el.dataset.ann !== undefined) { const a = S.ann[+el.dataset.ann]; if (a) { a.text = el.value; schedule(); } return; }
     if (el.dataset.fitlabel) { const f = S.fits.find(q => q.id === el.dataset.fitlabel); if (f) { f.label = el.value.trim() || undefined; schedule(); } return; }
+    if (el.dataset.pi !== undefined && el.dataset.pp !== 'fixed') { startInput(el, false); return; }
     if (!el.dataset.bind || el.type === 'checkbox' || el.type === 'radio' || el.tagName === 'SELECT' || el.dataset.commit === 'change') return;
     onBind(el);
   });
@@ -7258,10 +7398,17 @@ function init() {
       refreshDataset(ds); schedule(); renderDrawer(); return;
     }
     if (el.dataset.pi !== undefined) {
-      const p = S.draft.params[+el.dataset.pi], k = el.dataset.pp;
+      const i = +el.dataset.pi, p = S.draft.params[i], k = el.dataset.pp;
       if (!p) return;
-      if (k === 'fixed') p.fixed = el.checked;
-      else { const v = el.value === '' ? null : parseFloat(el.value); p[k] = isFinite(v) ? v : null; }
+      if (k === 'fixed') {
+        p.fixed = el.checked;
+        if (p.fixed && p.start === null) {
+          if ((M.MODELS[S.draft.model] || {}).poly) p.start = 0;
+          else { const g = autoGuess(); p.start = g && isFinite(g[i]) ? +(+g[i]).toPrecision(6) : null; }
+        }
+        renderPanel(); schedule(); return;
+      }
+      startInput(el, true);
       return;
     }
     if (el.dataset.sk) { seriesProp(el); return; }
